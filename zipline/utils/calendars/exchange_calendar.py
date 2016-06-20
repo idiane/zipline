@@ -12,42 +12,29 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from abc import (
-    ABCMeta,
-    abstractproperty,
-    abstractmethod,
-)
-
-import pandas as pd
+from abc import ABCMeta
+from six import with_metaclass
+from numpy import searchsorted
 import numpy as np
+import pandas as pd
 from pandas import (
     DataFrame,
     date_range,
-    DateOffset,
     DatetimeIndex,
+    DateOffset
 )
 from pandas.tseries.offsets import CustomBusinessDay
-from six import with_metaclass
 
 from zipline.errors import (
     InvalidCalendarName,
     CalendarNameCollision,
 )
-from zipline.utils.memoize import remember_last
-
-from .calendar_helpers import (
-    next_scheduled_day,
-    previous_scheduled_day,
-    next_open_and_close,
-    previous_open_and_close,
-    scheduled_day_distance,
-    minutes_for_day,
-    days_in_range,
-    minutes_for_days_in_range,
-    add_scheduled_days,
-    next_scheduled_minute,
-    previous_scheduled_minute,
+from zipline.utils.calendars._calendar_helpers import (
+    next_divider_idx,
+    previous_divider_idx,
+    is_open
 )
+from zipline.utils.memoize import remember_last, lazyval
 
 start_default = pd.Timestamp('1990-01-01', tz='UTC')
 end_base = pd.Timestamp('today', tz='UTC')
@@ -56,6 +43,548 @@ end_base = pd.Timestamp('today', tz='UTC')
 end_default = end_base + pd.Timedelta(days=365)
 
 NANOS_IN_MINUTE = 60000000000
+
+
+class ExchangeCalendar(with_metaclass(ABCMeta)):
+    """
+    An ExchangeCalendar represents the timing information of a single market
+    exchange.
+
+    The timing information is made up of two parts: sessions, and opens/closes.
+
+    A session represents a contiguous set of minutes, and has a label that is
+    midnight UTC. It is important to note that a session label should not be
+    considered a specific point in time, and that midnight UTC is just being
+    used for convenience.
+
+    For each session, we store the open and close time in UTC time.
+    """
+    def __init__(self, start=start_default, end=end_default):
+        open_offset = self.open_offset
+        close_offset = self.close_offset
+
+        # Define those days on which the exchange is usually open.
+        self.day = CustomBusinessDay(
+            holidays=self.holidays_adhoc,
+            calendar=self.holidays_calendar,
+        )
+
+        # Midnight in UTC for each trading day.
+        _all_days = date_range(start, end, freq=self.day, tz='UTC')
+
+        # `DatetimeIndex`s of standard opens/closes for each day.
+        self._opens = days_at_time(_all_days, self.open_time, self.tz,
+                                   open_offset)
+        self._closes = days_at_time(
+            _all_days, self.close_time, self.tz, close_offset
+        )
+
+        # `DatetimeIndex`s of nonstandard opens/closes
+        _special_opens = self._special_opens(start, end)
+        _special_closes = self._special_closes(start, end)
+
+        # Overwrite the special opens and closes on top of the standard ones.
+        _overwrite_special_dates(_all_days, self._opens, _special_opens)
+        _overwrite_special_dates(_all_days, self._closes, _special_closes)
+
+        # In pandas 0.16.1 _opens and _closes will lose their timezone
+        # information. This looks like it has been resolved in 0.17.1.
+        # http://pandas.pydata.org/pandas-docs/stable/whatsnew.html#datetime-with-tz  # noqa
+        self.schedule = DataFrame(
+            index=_all_days,
+            columns=['market_open', 'market_close'],
+            data={
+                'market_open': self._opens,
+                'market_close': self._closes,
+            },
+            dtype='datetime64[ns]',
+        )
+
+        self.market_opens_nanos = self.schedule.market_open.values.\
+            astype(np.int64)
+
+        self.market_closes_nanos = self.schedule.market_close.values.\
+            astype(np.int64)
+
+        self._trading_minutes_nanos = self.all_minutes.values.\
+            astype(np.int64)
+
+        self.first_trading_session = _all_days[0]
+        self.last_trading_session = _all_days[-1]
+
+        self._early_closes = pd.DatetimeIndex(
+            _special_closes.map(self.minute_to_session_label)
+        )
+
+    @property
+    def opens(self):
+        return self.schedule.market_open
+
+    @property
+    def closes(self):
+        return self.schedule.market_close
+
+    @property
+    def early_closes(self):
+        return self._early_closes
+
+    def is_open_on_minute(self, dt):
+        """
+        Given a dt, return whether this exchange is open at the given dt.
+
+        Parameters
+        ----------
+        dt: pd.Timestamp
+            The dt for which to check if this exchange is open.
+
+        Returns
+        -------
+        bool
+            Whether the exchange is open on this dt.
+        """
+        return is_open(self.market_opens_nanos, self.market_closes_nanos,
+                       dt.value)
+
+    def next_open(self, dt):
+        """
+        Given a dt, returns the next open.
+
+        If the given dt happens to be a session open, the next session's open
+        will be returned.
+
+        Parameters
+        ----------
+        dt: pd.Timestamp
+            The dt for which to get the next open.
+
+        Returns
+        -------
+        pd.Timestamp
+            The UTC timestamp of the next open.
+        """
+        idx = next_divider_idx(self.market_opens_nanos, dt.value)
+        return self.schedule.market_open[idx].tz_localize('UTC')
+
+    def next_close(self, dt):
+        """
+        Given a dt, returns the next close.
+
+        Parameters
+        ----------
+        dt: pd.Timestamp
+            The dt for which to get the next close.
+
+        Returns
+        -------
+        pd.Timestamp
+            The UTC timestamp of the next close.
+        """
+        idx = next_divider_idx(self.market_closes_nanos, dt.value)
+        return self.schedule.market_close[idx].tz_localize('UTC')
+
+    def previous_open(self, dt):
+        """
+        Given a dt, returns the previous open.
+
+        Parameters
+        ----------
+        dt: pd.Timestamp
+            The dt for which to get the previous open.
+
+        Returns
+        -------
+        pd.Timestamp
+            The UTC imestamp of the previous open.
+        """
+        idx = previous_divider_idx(self.market_opens_nanos, dt.value)
+        return self.schedule.market_open[idx].tz_localize('UTC')
+
+    def previous_close(self, dt):
+        """
+        Given a dt, returns the previous close.
+
+        Parameters
+        ----------
+        dt: pd.Timestamp
+            The dt for which to get the previous close.
+
+        Returns
+        -------
+        pd.Timestamp
+            The UTC timestamp of the previous close.
+        """
+        idx = previous_divider_idx(self.market_closes_nanos, dt.value)
+        return self.schedule.market_close[idx].tz_localize('UTC')
+
+    def next_minute(self, dt):
+        """
+        Given a dt, return the next exchange minute.  If the given dt is not
+        an exchange minute, returns the next exchange open.
+
+        Parameters
+        ----------
+        dt: pd.Timestamp
+            The dt for which to get the next exchange minute.
+
+        Returns
+        -------
+        pd.Timestamp
+            The next exchange minute.
+        """
+        idx = next_divider_idx(self._trading_minutes_nanos, dt.value)
+        return pd.Timestamp(self._trading_minutes_nanos[idx], tz='UTC')
+
+    def previous_minute(self, dt):
+        """
+        Given a dt, return the previous exchange minute.
+
+        Raises KeyError if the given timestamp is not an exchange minute.
+
+        Parameters
+        ----------
+        dt: pd.Timestamp
+            The dt for which to get the previous exchange minute.
+
+        Returns
+        -------
+        pd.Timestamp
+            The previous exchange minute.
+        """
+
+        idx = previous_divider_idx(self._trading_minutes_nanos, dt.value)
+        return pd.Timestamp(self._trading_minutes_nanos[idx], tz='UTC')
+
+    def next_session_label(self, session_label):
+        """
+        Given a session label, returns the label of the next session.
+
+        Parameters
+        ----------
+        session_label: pd.Timestamp
+            A session whose next session is desired.
+
+        Returns
+        -------
+        pd.Timestamp
+            The next session label (midnight UTC).
+
+        Notes
+        -----
+        Raises ValueError if the given session is the last session in this
+        calendar.
+        """
+        idx = self.schedule.index.get_loc(session_label)
+        try:
+            return self.schedule.index[idx + 1]
+        except IndexError:
+            if idx == len(self.schedule.index) - 1:
+                raise ValueError("There is no next session as this is the end"
+                                 "of the exchange calendar.")
+
+    def previous_session_label(self, session_label):
+        """
+        Given a session label, returns the label of the previous session.
+
+        Parameters
+        ----------
+        session_label: pd.Timestamp
+            A session whose previous session is desired.
+
+        Returns
+        -------
+        pd.Timestamp
+            The previous session label (midnight UTC).
+
+        Notes
+        -----
+        Raises ValueError if the given session is the first session in this
+        calendar.
+        """
+        idx = self.schedule.index.get_loc(session_label)
+        if idx == 0:
+            raise ValueError("There is no previous session as this is the"
+                             "beginning of the exchange calendar.")
+
+        return self.schedule.index[idx - 1]
+
+    def minutes_for_session(self, session_label):
+        """
+        Given a session label, return the minutes for that session.
+
+        Parameters
+        ----------
+        session_label: pd.Timestamp (midnight UTC)
+            A session label whose session's minutes are desired.
+
+        Returns
+        -------
+        pd.DateTimeIndex
+            All the minutes for the given session.
+        """
+        data = self.schedule.loc[session_label]
+        return self.all_minutes[
+            self.all_minutes.slice_indexer(
+                data.market_open,
+                data.market_close
+            )
+        ]
+
+    def minutes_window(self, start_dt, count):
+        try:
+            start_idx = self.all_minutes.get_loc(start_dt)
+        except KeyError:
+            # if this is not a market minute, go to the previous session's
+            # close
+            previous_session = self.minute_to_session_label(
+                start_dt, direction="previous"
+            )
+
+            previous_close = self.open_and_close_for_session(
+                previous_session
+            )[1]
+
+            start_idx = self.all_minutes.get_loc(previous_close)
+
+        end_idx = start_idx + count
+
+        if start_idx > end_idx:
+            return self.all_minutes[(end_idx + 1):(start_idx + 1)]
+        else:
+            return self.all_minutes[start_idx:end_idx]
+
+    def sessions_in_range(self, start_session_label, end_session_label):
+        """
+        Given start and end session labels, return all the sessions in that
+        range, inclusive.
+
+        Parameters
+        ----------
+        start_session_label: pd.Timestamp (midnight UTC)
+            The label representing the first session of the desired range.
+
+        end_session_label: pd.Timestamp (midnight UTC)
+            The label representing the last session of the desired range.
+
+        Returns
+        -------
+        pd.DatetimeIndex
+            The desired sessions.
+        """
+        return self.all_sessions[
+            self.all_sessions.slice_indexer(
+                start_session_label,
+                end_session_label
+            )
+        ]
+
+    def sessions_window(self, session_label, count):
+        # FIXME TEST THIS
+        start_idx = self.schedule.index.get_loc(session_label)
+        end_idx = start_idx + count
+
+        if start_idx > end_idx:
+            return self.all_sessions[end_idx:(start_idx + 1)]
+        else:
+            return self.all_sessions[start_idx:end_idx + 1]
+
+    def session_distance(self, start_session_label, end_session_label):
+        # FIXME TEST AND DOCUMENT
+        return len(self.sessions_in_range(
+            start_session_label,
+            end_session_label)
+        )
+
+    def minutes_in_range(self, start_minute, end_minute):
+        """
+        Given start and end minutes, return all the exchange minutes
+        in that range, inclusive.
+
+        Given minutes don't need to be exchange minutes (can be when the
+        exchange is closed).
+
+        Parameters
+        ----------
+        start_minute: pd.Timestamp
+            The minute representing the start of the desired range.
+
+        end_minute: pd.Timestamp
+            The minute representing the end of the desired range.
+
+        Returns
+        -------
+        pd.DatetimeIndex
+            The exchange minutes in the desired range.
+        """
+        start_idx = searchsorted(self._trading_minutes_nanos,
+                                 start_minute.value)
+
+        end_idx = searchsorted(self._trading_minutes_nanos,
+                               end_minute.value)
+
+        if end_minute.value == self._trading_minutes_nanos[end_idx]:
+            # if the end minute is a market minute, increase by 1
+            end_idx += 1
+
+        return self.all_minutes[start_idx:end_idx]
+
+    # FIXME test this method
+    def minutes_for_sessions_in_range(self, start_session_label,
+                                      end_session_label):
+        first_minute, _ = self.open_and_close_for_session(start_session_label)
+        _, last_minute = self.open_and_close_for_session(end_session_label)
+
+        return self.minutes_in_range(first_minute, last_minute)
+
+    def open_and_close_for_session(self, session_label):
+        """
+        Returns a tuple of timestamps of the open and close of the session
+        represented by the given label.
+
+        Parameters
+        ----------
+        session_label: pd.Timestamp
+            The session whose open and close are desired.
+
+        Returns
+        -------
+        (Timestamp, Timestamp)
+            The open and close for the given session.
+        """
+        o_and_c = self.schedule.loc[session_label]
+
+        # `market_open` and `market_close` should be timezone aware, but pandas
+        # 0.16.1 does not appear to support this:
+        # http://pandas.pydata.org/pandas-docs/stable/whatsnew.html#datetime-with-tz  # noqa
+        return (o_and_c['market_open'].tz_localize('UTC'),
+                o_and_c['market_close'].tz_localize('UTC'))
+
+    @property
+    def all_sessions(self):
+        return self.schedule.index
+
+    @property
+    def first_session(self):
+        return self.all_sessions[0]
+
+    @property
+    def last_session(self):
+        return self.all_sessions[-1]
+
+    @property
+    @remember_last
+    def all_minutes(self):
+        """
+        Returns a DatetimeIndex representing all the minutes in this calendar.
+        """
+        opens_in_ns = \
+            self._opens.values.astype('datetime64[ns]').astype(np.int64)
+
+        closes_in_ns = \
+            self._closes.values.astype('datetime64[ns]').astype(np.int64)
+
+        deltas = closes_in_ns - opens_in_ns
+
+        # + 1 because we want 390 days per standard day, not 389
+        daily_sizes = (deltas / NANOS_IN_MINUTE) + 1
+        num_minutes = np.sum(daily_sizes).astype(np.int64)
+
+        # One allocation for the entire thing. This assumes that each day
+        # represents a contiguous block of minutes.
+        all_minutes = np.empty(num_minutes, dtype='datetime64[ns]')
+
+        idx = 0
+        for day_idx, size in enumerate(daily_sizes):
+            # lots of small allocations, but it's fast enough for now.
+            all_minutes[idx:(idx + size)] = \
+                np.arange(
+                    opens_in_ns[day_idx],
+                    closes_in_ns[day_idx] + NANOS_IN_MINUTE,
+                    NANOS_IN_MINUTE
+                )
+
+            idx += size
+
+        return DatetimeIndex(all_minutes).tz_localize("UTC")
+
+    def minute_to_session_label(self, dt, direction="next"):
+        """
+        Given a minute, get the label of its containing session.
+
+        Parameters
+        ----------
+        dt : pd.Timestamp
+            The dt for which to get the containing session.
+
+        direction: str
+            "next" (default) means that if the given dt is not part of a
+            session, return the label of the next session.
+
+            "previous" means that if the given dt is not part of a session,
+            return the label of the previous session.
+
+            "none" means that a KeyError will be raised if the given
+            dt is not part of a session.
+
+        Returns
+        -------
+        pd.Timestamp (midnight UTC)
+            The label of the containing session.
+        """
+
+        idx = searchsorted(self.market_closes_nanos, dt.value)
+        current_or_next_session = self.schedule.index[idx]
+
+        if direction == "previous":
+            if not is_open(self.market_opens_nanos, self.market_closes_nanos,
+                           dt.value):
+                # if the exchange is closed, use the previous session
+                return self.schedule.index[idx - 1]
+        elif direction == "none":
+            if not is_open(self.market_opens_nanos, self.market_closes_nanos,
+                           dt.value):
+                # if the exchange is closed, blow up
+                raise ValueError("The given dt is not an exchange minute!")
+        elif direction != "next":
+            # invalid direction
+            raise ValueError("Invalid direction parameter: "
+                             "{0}".format(direction))
+
+        return current_or_next_session
+
+    def _special_dates(self, calendars, ad_hoc_dates, start_date, end_date):
+        """
+        Union an iterable of pairs of the form (time, calendar)
+        and an iterable of pairs of the form (time, [dates])
+
+        (This is shared logic for computing special opens and special closes.)
+        """
+        _dates = DatetimeIndex([], tz='UTC').union_many(
+            [
+                holidays_at_time(calendar, start_date, end_date, time_,
+                                 self.tz)
+                for time_, calendar in calendars
+            ] + [
+                days_at_time(datetimes, time_, self.tz)
+                for time_, datetimes in ad_hoc_dates
+            ]
+        )
+        return _dates[(_dates >= start_date) & (_dates <= end_date)]
+
+    def _special_opens(self, start, end):
+        return self._special_dates(
+            self.special_opens_calendars,
+            self.special_opens_adhoc,
+            start,
+            end,
+        )
+
+    def _special_closes(self, start, end):
+        return self._special_dates(
+            self.special_closes_calendars,
+            self.special_closes_adhoc,
+            start,
+            end,
+        )
 
 
 def days_at_time(days, t, tz, day_offset=0):
@@ -130,359 +659,6 @@ def _overwrite_special_dates(midnight_utcs,
     opens_or_closes.values[indexer] = special_opens_or_closes.values
 
 
-class ExchangeCalendar(with_metaclass(ABCMeta)):
-    """
-    An ExchangeCalendar represents the timing information of a single market
-    exchange.
-
-    Properties
-    ----------
-    name : str
-        The name of this exchange calendar.
-        e.g.: 'NYSE', 'LSE', 'CME Energy'
-    tz : timezone
-        The native timezone of the exchange.
-    """
-
-    def __init__(self, start=start_default, end=end_default):
-        tz = self.tz
-        open_offset = self.open_offset
-        close_offset = self.close_offset
-
-        # Define those days on which the exchange is usually open.
-        self.day = CustomBusinessDay(
-            holidays=self.holidays_adhoc,
-            calendar=self.holidays_calendar,
-        )
-
-        # Midnight in UTC for each trading day.
-        _all_days = date_range(start, end, freq=self.day, tz='UTC')
-
-        # `DatetimeIndex`s of standard opens/closes for each day.
-        self._opens = days_at_time(_all_days, self.open_time, tz, open_offset)
-        self._closes = days_at_time(
-            _all_days, self.close_time, tz, close_offset
-        )
-
-        # `DatetimeIndex`s of nonstandard opens/closes
-        _special_opens = self._special_opens(start, end)
-        _special_closes = self._special_closes(start, end)
-
-        # Overwrite the special opens and closes on top of the standard ones.
-        _overwrite_special_dates(_all_days, self._opens, _special_opens)
-        _overwrite_special_dates(_all_days, self._closes, _special_closes)
-
-        # In pandas 0.16.1 _opens and _closes will lose their timezone
-        # information. This looks like it has been resolved in 0.17.1.
-        # http://pandas.pydata.org/pandas-docs/stable/whatsnew.html#datetime-with-tz  # noqa
-        self.schedule = DataFrame(
-            index=_all_days,
-            columns=['market_open', 'market_close'],
-            data={
-                'market_open': self._opens,
-                'market_close': self._closes,
-            },
-            dtype='datetime64[ns]',
-        )
-
-        self.first_trading_day = _all_days[0]
-        self.last_trading_day = _all_days[-1]
-        self.early_closes = DatetimeIndex(
-            _special_closes.map(self.session_date)
-        )
-
-    def next_trading_day(self, date):
-        return next_scheduled_day(
-            date,
-            last_trading_day=self.last_trading_day,
-            is_scheduled_day_hook=self.is_open_on_day,
-        )
-
-    def previous_trading_day(self, date):
-        return previous_scheduled_day(
-            date,
-            first_trading_day=self.first_trading_day,
-            is_scheduled_day_hook=self.is_open_on_day,
-        )
-
-    def next_open_and_close(self, date):
-        return next_open_and_close(
-            date,
-            open_and_close_hook=self.open_and_close,
-            next_scheduled_day_hook=self.next_trading_day,
-        )
-
-    def previous_open_and_close(self, date):
-        return previous_open_and_close(
-            date,
-            open_and_close_hook=self.open_and_close,
-            previous_scheduled_day_hook=self.previous_trading_day,
-        )
-
-    def trading_day_distance(self, first_date, second_date):
-        return scheduled_day_distance(
-            first_date, second_date,
-            all_days=self.all_trading_days,
-        )
-
-    def trading_minutes_for_day(self, day):
-        return minutes_for_day(
-            day,
-            open_and_close_hook=self.open_and_close,
-        )
-
-    def trading_days_in_range(self, start, end):
-        return days_in_range(
-            start, end,
-            all_days=self.all_trading_days,
-        )
-
-    def trading_minutes_for_days_in_range(self, start, end):
-        return minutes_for_days_in_range(
-            start, end,
-            days_in_range_hook=self.trading_days_in_range,
-            minutes_for_day_hook=self.trading_minutes_for_day,
-        )
-
-    def add_trading_days(self, n, date):
-        """
-        Adds n trading days to date. If this would fall outside of the
-        ExchangeCalendar, a NoFurtherDataError is raised.
-
-        Parameters
-        ----------
-        n : int
-            The number of days to add to date, this can be positive or
-            negative.
-        date : datetime
-            The date to add to.
-
-        Returns
-        -------
-        datetime
-            n trading days added to date.
-        """
-        return add_scheduled_days(
-            n, date,
-            next_scheduled_day_hook=self.next_trading_day,
-            previous_scheduled_day_hook=self.previous_trading_day,
-            all_trading_days=self.all_trading_days,
-        )
-
-    def next_trading_minute(self, start):
-        return next_scheduled_minute(
-            start,
-            is_scheduled_day_hook=self.is_open_on_day,
-            open_and_close_hook=self.open_and_close,
-            next_open_and_close_hook=self.next_open_and_close,
-        )
-
-    def previous_trading_minute(self, start):
-        return previous_scheduled_minute(
-            start,
-            is_scheduled_day_hook=self.is_open_on_day,
-            open_and_close_hook=self.open_and_close,
-            previous_open_and_close_hook=self.previous_open_and_close,
-        )
-
-    def _special_dates(self, calendars, ad_hoc_dates, start_date, end_date):
-        """
-        Union an iterable of pairs of the form
-
-        (time, calendar)
-
-        and an iterable of pairs of the form
-
-        (time, [dates])
-
-        (This is shared logic for computing special opens and special closes.)
-        """
-        tz = self.native_timezone
-        _dates = DatetimeIndex([], tz='UTC').union_many(
-            [
-                holidays_at_time(calendar, start_date, end_date, time_, tz)
-                for time_, calendar in calendars
-            ] + [
-                days_at_time(datetimes, time_, tz)
-                for time_, datetimes in ad_hoc_dates
-            ]
-        )
-        return _dates[(_dates >= start_date) & (_dates <= end_date)]
-
-    def _special_opens(self, start, end):
-        return self._special_dates(
-            self.special_opens_calendars,
-            self.special_opens_adhoc,
-            start,
-            end,
-        )
-
-    def _special_closes(self, start, end):
-        return self._special_dates(
-            self.special_closes_calendars,
-            self.special_closes_adhoc,
-            start,
-            end,
-        )
-
-    @abstractproperty
-    def name(self):
-        """
-        The name of this exchange calendar.
-        E.g.: 'NYSE', 'LSE', 'CME Energy'
-        """
-        raise NotImplementedError()
-
-    @abstractproperty
-    def tz(self):
-        """
-        The native timezone of the exchange.
-
-        SD: Not clear that this needs to be exposed.
-        """
-        raise NotImplementedError()
-
-    @abstractmethod
-    def is_open_on_minute(self, dt):
-        """
-        Is the exchange open at minute @dt.
-
-        Parameters
-        ----------
-        dt : Timestamp
-
-        Returns
-        -------
-        bool
-            True if  exchange is open at the given dt, otherwise False.
-        """
-        raise NotImplementedError()
-
-    @abstractmethod
-    def is_open_on_day(self, dt):
-        """
-        Is the exchange open anytime during @dt.
-
-        SD: Need to decide whether this method answers the question:
-        - Is exchange open at any time during the calendar day containing dt
-        or
-        - Is exchange open at any time during the trading session containg dt.
-        Semantically it seems that the first makes more sense.
-
-        Parameters
-        ----------
-        dt : Timestamp
-            The UTC-canonicalized date.
-
-        Returns
-        -------
-        bool
-            True if exchange is open at any time during @dt.
-        """
-        raise NotImplementedError()
-
-    @abstractmethod
-    def trading_days(self, start, end):
-        """
-        Calculates all of the exchange sessions between the given
-        start and end.
-
-        SD: Presumably @start and @end are UTC-canonicalized, as our exchange
-        sessions are. If not, then it's not clear how this method should behave
-        if @start and @end are both in the middle of the day.
-
-        Parameters
-        ----------
-        start : Timestamp
-        end : Timestamp
-
-        Returns
-        -------
-        DatetimeIndex
-            A DatetimeIndex populated with all of the trading days between
-            the given start and end.
-        """
-        raise NotImplementedError()
-
-    @property
-    def all_trading_days(self):
-        return self.schedule.index
-
-    @property
-    @remember_last
-    def all_trading_minutes(self):
-        opens_in_ns = \
-            self._opens.values.astype('datetime64[ns]').astype(np.int64)
-
-        closes_in_ns = \
-            self._closes.values.astype('datetime64[ns]').astype(np.int64)
-
-        deltas = closes_in_ns - opens_in_ns
-
-        # + 1 because we want 390 days per standard day, not 389
-        daily_sizes = (deltas / NANOS_IN_MINUTE) + 1
-        num_minutes = np.sum(daily_sizes).astype(np.int64)
-
-        # One allocation for the entire thing. This assumes that each day
-        # represents a contiguous block of minutes, which might not always
-        # be the case in the future.
-        all_minutes = np.empty(num_minutes, dtype='datetime64[ns]')
-
-        idx = 0
-        for day_idx, size in enumerate(daily_sizes):
-            # lots of small allocations, but it's fast enough for now.
-            all_minutes[idx:(idx + size)] = \
-                np.arange(
-                    opens_in_ns[day_idx],
-                    closes_in_ns[day_idx] + NANOS_IN_MINUTE,
-                    NANOS_IN_MINUTE
-                )
-
-            idx += size
-
-        return DatetimeIndex(all_minutes).tz_localize("UTC")
-
-    @abstractmethod
-    def open_and_close(self, date):
-        """
-        Given a UTC-canonicalized date, returns a tuple of timestamps of the
-        open and close of the exchange session on that date.
-
-        SD: Can @date be an arbitrary datetime, or should we first map it to
-        and exchange session using session_date. Need to check what the
-        consumers expect.
-
-        Parameters
-        ----------
-        date : Timestamp
-            The UTC-canonicalized date whose open and close are needed.
-
-        Returns
-        -------
-        (Timestamp, Timestamp)
-            The open and close for the given date.
-        """
-        raise NotImplementedError()
-
-    @abstractmethod
-    def session_date(self, dt):
-        """
-        Given a time, returns the UTC-canonicalized date of the exchange
-        session in which the time belongs. If the time is not in an exchange
-        session (while the market is closed), returns the date of the next
-        exchange session after the time.
-
-        Parameters
-        ----------
-        dt : Timestamp
-
-        Returns
-        -------
-        Timestamp
-            The date of the exchange session in which dt belongs.
-        """
-        raise NotImplementedError()
-
 
 _static_calendars = {}
 
@@ -495,6 +671,11 @@ def get_calendar(name):
     ----------
     name : str
         The name of the ExchangeCalendar to be retrieved.
+
+    Returns
+    -------
+    ExchangeCalendar
+        The desired calendar.
     """
     # First, check if the calendar is already registered
     if name not in _static_calendars:
@@ -586,3 +767,6 @@ def register_calendar(calendar, force=False):
         raise CalendarNameCollision(calendar_name=calendar.name)
 
     _static_calendars[calendar.name] = calendar
+
+
+default_nyse_calendar = get_calendar("NYSE")
